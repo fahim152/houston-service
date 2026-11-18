@@ -1,0 +1,98 @@
+services:
+  rockets-api:
+    build: .
+    image: rockets-service:local
+    ports:
+      # Host port defaults to 8088, the URL the rockets test program uses. Override with ROCKETS_PORT=… if 8088 is busy.
+      - "${ROCKETS_PORT:-8088}:8088"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      Rockets__PostgresConnectionString: "Host=postgres;Port=5432;Username=rockets;Password=rockets;Database=rockets"
+      Rockets__PulsarServiceUrl: "pulsar://pulsar:6650"
+      # Send OpenTelemetry metrics and logs to the dashboard below (see Program.cs), every second instead of every 60 s / 5 s.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://aspire-dashboard:18889
+      OTEL_METRIC_EXPORT_INTERVAL: "1000"
+      OTEL_BLRP_SCHEDULE_DELAY: "1000"
+      # Limits from appsettings.json can be overridden here, e.g.:
+      # Rockets__MaxPendingMessagesPerRocket: "1000"
+    depends_on:
+      # The service can't ingest without Pulsar or process without Postgres, so it waits until both are healthy.
+      postgres:
+        condition: service_healthy
+      pulsar:
+        condition: service_healthy
+    healthcheck:
+      # The runtime image has no curl, so the check uses bash's built-in TCP support.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8088 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q Healthy <&3"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # Event store + current state of each rocket. Published on 55432 for local `dotnet run` (avoids clashing with a local 5432).
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: rockets
+      POSTGRES_PASSWORD: rockets
+      POSTGRES_DB: rockets
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      # Survives `docker compose down` and restarts. `docker compose down -v` deletes it.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "rockets", "-d", "rockets"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Postgres web UI (read-only) at http://localhost:8089: browse the events and rocket_state tables, run SELECT queries.
+  pgweb:
+    image: sosedoff/pgweb:0.17.0
+    command: ["/usr/bin/pgweb", "--bind=0.0.0.0", "--listen=8081", "--readonly"]
+    environment:
+      DATABASE_URL: "postgres://rockets:rockets@postgres:5432/rockets?sslmode=disable"
+    ports:
+      - "${PGWEB_PORT:-8089}:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Message broker. Standalone mode = one container with broker + storage, fine for local use.
+  # Takes ~30–60 s to become healthy on first start.
+  pulsar:
+    image: apachepulsar/pulsar:4.0.14
+    command: ["bin/pulsar", "standalone", "--no-functions-worker", "--no-stream-storage"]
+    environment:
+      PULSAR_MEM: "-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m"
+    ports:
+      - "${PULSAR_PORT:-6650}:6650"   # for local `dotnet run`
+    volumes:
+      - pulsar-data:/pulsar/data
+    healthcheck:
+      test: ["CMD", "bin/pulsar-admin", "brokers", "healthcheck"]
+      interval: 10s
+      timeout: 15s
+      retries: 30
+      start_period: 30s
+
+  # Rockets UI: a small React page at http://localhost:3088 that polls GET /rockets every 5 s (nginx forwards /api/* to rockets-api).
+  rockets-ui:
+    build: ./ui
+    image: rockets-ui:local
+    ports:
+      - "${UI_PORT:-3088}:8080"
+
+  # Aspire Dashboard: live metrics and logs at http://localhost:18888 (no login; for local use only).
+  aspire-dashboard:
+    image: mcr.microsoft.com/aspire/dashboard:13.6
+    ports:
+      - "${DASHBOARD_PORT:-18888}:18888"        # dashboard UI
+      - "${DASHBOARD_OTLP_PORT:-18889}:18889"   # OTLP/gRPC, for the service run with `dotnet run --launch-profile dashboard`
+    environment:
+      ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS: "true"
+
+volumes:
+  postgres-data:
+  pulsar-data:

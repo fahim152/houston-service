@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tsbuildinfo
+Dockerfile
+.dockerignore
+README.md
+screenshot.png
